@@ -1,0 +1,12 @@
+# Build artifacts
+/target
+# IDE files
+/.idea
+/.vscode
+# Git
+.git
+.gitignore
+# Documentation & tests (not needed in container)
+README.md
+tests/
+*.md
