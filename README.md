@@ -58,17 +58,42 @@ src/
 
 ## 🚀 Quick Start
 
-### Prerequisites
+### Option 1: Docker Compose (Recommended)
 
-- [Rust](https://rustup.rs/) 1.85+
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (running)
+The easiest way to use the watchdog is to drop it into your existing `docker-compose.yml`. It will automatically detect your compose project and **only** monitor containers in that stack!
 
-### Run
+```bash
+# Clone the repository
+git clone https://github.com/Tanmaysarkar2002/DockerWatchdog.git
+cd DockerWatchdog
+
+# Build and start the watchdog
+docker-compose up -d --build
+```
+
+**Example `docker-compose.yml` integration:**
+```yaml
+services:
+  your-app:
+    image: node:alpine
+
+  watchdog:
+    build: .
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHDOG_AUTO_RESTART=true
+      - WATCHDOG_MAX_RESTARTS=3
+      - WATCHDOG_LOG_LEVEL=info
+    restart: unless-stopped
+```
+
+### Option 2: Running Locally (Rust)
 
 ```bash
 # Clone the repo
-git clone https://github.com/yourusername/docker-watchdog.git
-cd docker-watchdog
+git clone https://github.com/Tanmaysarkar2002/DockerWatchdog.git
+cd DockerWatchdog
 
 # Run the watchdog
 cargo run
@@ -85,12 +110,12 @@ docker run --rm --name failing-test alpine sh -c "echo 'Something went wrong!' &
 You should see the watchdog detect the crash and print the logs:
 
 ```
-INFO  🐕 docker-watchdog v0.1.0
-INFO  🔍 Watching for Docker container events...
-INFO  ⚠️  Container 'failing-test' (a1b2c3d4e5f6) action='die' exit_code=1
-WARN  🚨 ALERT: Container 'failing-test' (a1b2c3d4e5f6) action='die' exit_code=1
-WARN  ❌ Container 'failing-test' exited with a non-zero exit code!
-WARN  📋 Last logs:
+INFO  [WATCHDOG START] docker-watchdog v0.1.0
+INFO  [WATCHING] Watching for Docker container events...
+INFO  [CONTAINER DIED] Container 'failing-test' (a1b2c3d4e5f6) action='die' exit_code=1
+WARN  ALERT: Container 'failing-test' (a1b2c3d4e5f6) action='die' exit_code=1
+WARN  Container 'failing-test' exited with a non-zero exit code!
+WARN  Last logs:
       Something went wrong!
 ```
 
@@ -105,16 +130,8 @@ All config is via environment variables, with sensible defaults:
 | `WATCHDOG_AUTO_RESTART` | `false` | Enable auto-restart (`true`/`1`) |
 | `WATCHDOG_MAX_RESTARTS` | `3` | Max restart attempts per container |
 | `WATCHDOG_RESTART_DELAY` | `5` | Seconds to wait before restarting |
+| `WATCHDOG_COMPOSE_PROJECT`| `(auto)` | Force a specific compose project name |
 | `WATCHDOG_NO_COLOR` | `false` | Disable colored output |
-
-### Example with auto-restart
-
-```powershell
-$env:WATCHDOG_AUTO_RESTART = "true"
-$env:WATCHDOG_MAX_RESTARTS = "5"
-$env:WATCHDOG_RESTART_DELAY = "10"
-cargo run
-```
 
 ## 🧪 Running Tests
 
@@ -125,8 +142,8 @@ cargo test -- --test-threads=1
 > Note: `--test-threads=1` is required because some tests modify environment variables.
 
 ```
-running 24 tests
-test result: ok. 24 passed; 0 failed; 0 ignored
+running 30 tests
+test result: ok. 30 passed; 0 failed; 0 ignored
 ```
 
 ## 🏗️ Architecture
@@ -146,22 +163,26 @@ graph LR
 
 ## 🔌 Adding a Custom Notifier
 
-Implement the `Notifier` trait to add new notification channels:
+Implement the `Notifier` trait to add new notification channels (uses native zero-allocation async traits):
 
 ```rust
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 use docker_watchdog::docker::ContainerEvent;
 use docker_watchdog::notifier::Notifier;
 
 pub struct SlackNotifier { webhook_url: String }
 
-#[async_trait]
 impl Notifier for SlackNotifier {
     fn name(&self) -> &str { "slack" }
 
-    async fn notify(&self, event: &ContainerEvent, logs: &str) -> Result<(), String> {
-        // Send to Slack webhook...
-        Ok(())
+    fn notify<'a>(&'a self, event: &'a ContainerEvent, logs: &'a str) 
+        -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> 
+    {
+        Box::pin(async move {
+            // Send to Slack webhook...
+            Ok(())
+        })
     }
 }
 ```
