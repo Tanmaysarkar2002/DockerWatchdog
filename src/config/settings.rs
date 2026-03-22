@@ -1,24 +1,22 @@
-/// Application-level configuration for docker-watchdog.
-///
-/// This struct holds all tunable parameters. In the future,
-/// this can be loaded from a TOML/YAML config file.
+use tracing::warn;
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
-    /// Number of tail log lines to fetch when a container dies.
     pub log_tail_lines: u64,
-    /// Log level filter (e.g., "info", "debug", "warn").
     pub log_level: String,
-    /// Whether to enable colored terminal output.
     pub colored_output: bool,
-    /// Whether to auto-restart containers that exit with non-zero codes.
     pub auto_restart: bool,
-    /// Maximum number of restart attempts per container before giving up.
     pub max_restarts: u32,
-    /// Delay in seconds before attempting a restart.
     pub restart_delay_secs: u64,
-    /// If set, only monitor containers from this compose project.
-    /// Matches the `com.docker.compose.project` label.
     pub compose_project: Option<String>,
+    pub ignore_containers: Vec<String>,
+    pub cooldown_secs: u64,
+    pub restart_backoff: bool,
+    pub heartbeat_secs: u64,
+    pub event_timeout_secs: u64,
+    pub dry_run: bool,
+    pub startup_scan: bool,
+    pub dedup_window_secs: u64,
 }
 
 impl Default for AppConfig {
@@ -31,48 +29,57 @@ impl Default for AppConfig {
             max_restarts: 3,
             restart_delay_secs: 5,
             compose_project: None,
+            ignore_containers: Vec::new(),
+            cooldown_secs: 300,
+            restart_backoff: true,
+            heartbeat_secs: 300,
+            event_timeout_secs: 600,
+            dry_run: false,
+            startup_scan: true,
+            dedup_window_secs: 5,
         }
     }
 }
 
+fn env_parse<T: std::str::FromStr>(key: &str, target: &mut T) {
+    if let Ok(val) = std::env::var(key) {
+        if let Ok(parsed) = val.parse() {
+            *target = parsed;
+        }
+    }
+}
+
+fn env_bool(key: &str) -> Option<bool> {
+    std::env::var(key).ok().map(|val| val == "1" || val.eq_ignore_ascii_case("true"))
+}
+
 impl AppConfig {
-    /// Creates a new AppConfig from environment variables,
-    /// falling back to defaults for any missing values.
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
-        if let Ok(val) = std::env::var("WATCHDOG_LOG_TAIL") {
-            if let Ok(n) = val.parse::<u64>() {
-                config.log_tail_lines = n;
-            }
-        }
+        env_parse("WATCHDOG_LOG_TAIL", &mut config.log_tail_lines);
+        env_parse("WATCHDOG_LOG_LEVEL", &mut config.log_level);
+        env_parse("WATCHDOG_MAX_RESTARTS", &mut config.max_restarts);
+        env_parse("WATCHDOG_RESTART_DELAY", &mut config.restart_delay_secs);
+        env_parse("WATCHDOG_COOLDOWN_SECS", &mut config.cooldown_secs);
+        env_parse("WATCHDOG_HEARTBEAT_SECS", &mut config.heartbeat_secs);
+        env_parse("WATCHDOG_EVENT_TIMEOUT_SECS", &mut config.event_timeout_secs);
+        env_parse("WATCHDOG_DEDUP_WINDOW_SECS", &mut config.dedup_window_secs);
 
-        if let Ok(val) = std::env::var("WATCHDOG_LOG_LEVEL") {
-            config.log_level = val;
+        if let Some(true) = env_bool("WATCHDOG_NO_COLOR") {
+            config.colored_output = false;
         }
-
-        if let Ok(val) = std::env::var("WATCHDOG_NO_COLOR") {
-            if val == "1" || val.to_lowercase() == "true" {
-                config.colored_output = false;
-            }
+        if let Some(val) = env_bool("WATCHDOG_AUTO_RESTART") {
+            config.auto_restart = val;
         }
-
-        if let Ok(val) = std::env::var("WATCHDOG_AUTO_RESTART") {
-            if val == "1" || val.to_lowercase() == "true" {
-                config.auto_restart = true;
-            }
+        if let Some(val) = env_bool("WATCHDOG_RESTART_BACKOFF") {
+            config.restart_backoff = val;
         }
-
-        if let Ok(val) = std::env::var("WATCHDOG_MAX_RESTARTS") {
-            if let Ok(n) = val.parse::<u32>() {
-                config.max_restarts = n;
-            }
+        if let Some(val) = env_bool("WATCHDOG_DRY_RUN") {
+            config.dry_run = val;
         }
-
-        if let Ok(val) = std::env::var("WATCHDOG_RESTART_DELAY") {
-            if let Ok(n) = val.parse::<u64>() {
-                config.restart_delay_secs = n;
-            }
+        if let Some(val) = env_bool("WATCHDOG_STARTUP_SCAN") {
+            config.startup_scan = val;
         }
 
         if let Ok(val) = std::env::var("WATCHDOG_COMPOSE_PROJECT") {
@@ -81,6 +88,41 @@ impl AppConfig {
             }
         }
 
+        if let Ok(val) = std::env::var("WATCHDOG_IGNORE_CONTAINERS") {
+            config.ignore_containers = val
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+
+        config.validate();
         config
+    }
+
+    fn validate(&mut self) {
+        if self.max_restarts > 100 {
+            warn!("WATCHDOG_MAX_RESTARTS={} is unusually high, capping at 100.", self.max_restarts);
+            self.max_restarts = 100;
+        }
+        if self.restart_delay_secs > 3600 {
+            warn!("WATCHDOG_RESTART_DELAY={}s exceeds 1 hour, capping at 3600.", self.restart_delay_secs);
+            self.restart_delay_secs = 3600;
+        }
+        if self.heartbeat_secs < 10 {
+            warn!("WATCHDOG_HEARTBEAT_SECS={} is too low, setting to 10.", self.heartbeat_secs);
+            self.heartbeat_secs = 10;
+        }
+        if self.event_timeout_secs < 30 {
+            warn!("WATCHDOG_EVENT_TIMEOUT_SECS={} is too low, setting to 30.", self.event_timeout_secs);
+            self.event_timeout_secs = 30;
+        }
+        if self.log_tail_lines > 10000 {
+            warn!("WATCHDOG_LOG_TAIL={} is very high, capping at 10000.", self.log_tail_lines);
+            self.log_tail_lines = 10000;
+        }
+        if self.dry_run {
+            warn!("[DRY-RUN] Dry-run mode enabled — no containers will actually be restarted.");
+        }
     }
 }

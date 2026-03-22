@@ -1,96 +1,164 @@
 use std::collections::HashMap;
 use bollard::Docker;
-use tokio::time::{sleep, Duration};
-use tracing::{error, info, warn};
+use tokio::time::{Instant, sleep, Duration};
+use tracing::{debug, error, info, warn};
 
-/// Tracks restart attempts per container and handles auto-restart logic.
+struct ContainerState {
+    attempts: u32,
+    last_restart: Option<Instant>,
+}
+
 pub struct RestartTracker {
-    /// Maps container_id -> number of restart attempts so far.
-    attempts: HashMap<String, u32>,
-
-    /// Maximum restarts allowed per container.
+    containers: HashMap<String, ContainerState>,
     max_restarts: u32,
-
-    /// Delay in seconds before attempting a restart.
-    delay_secs: u64,
+    base_delay_secs: u64,
+    backoff: bool,
+    cooldown_secs: u64,
+    dry_run: bool,
 }
 
 impl RestartTracker {
-    /// Creates a new RestartTracker with the given limits.
-    pub fn new(max_restarts: u32, delay_secs: u64) -> Self {
+    pub fn new(
+        max_restarts: u32,
+        base_delay_secs: u64,
+        backoff: bool,
+        cooldown_secs: u64,
+        dry_run: bool,
+    ) -> Self {
         Self {
-            attempts: HashMap::new(),
+            containers: HashMap::new(),
             max_restarts,
-            delay_secs,
+            base_delay_secs,
+            backoff,
+            cooldown_secs,
+            dry_run,
         }
     }
 
-    /// Checks if a restart is allowed and increments the attempt counter.
-    /// Returns `true` if a restart should proceed, `false` if the limit is reached.
-    /// This is separated from `try_restart` so it can be unit-tested without Docker.
-    pub fn should_restart(&mut self, container_id: &str, container_name: &str) -> bool {
-        let count = self.attempts.entry(container_id.to_string()).or_insert(0);
+    /// Resets counter if container ran longer than cooldown since last restart.
+    fn apply_cooldown(&mut self, container_id: &str) {
+        if self.cooldown_secs == 0 {
+            return;
+        }
+        if let Some(state) = self.containers.get(container_id) {
+            if let Some(last) = state.last_restart {
+                if last.elapsed() >= Duration::from_secs(self.cooldown_secs) {
+                    debug!(
+                        "Container {} ran for {}s (cooldown={}s), resetting restart counter.",
+                        container_id, last.elapsed().as_secs(), self.cooldown_secs
+                    );
+                    self.containers.remove(container_id);
+                }
+            }
+        }
+    }
 
-        if *count >= self.max_restarts {
+    fn compute_delay(&self, attempt: u32) -> u64 {
+        if self.backoff && attempt > 1 {
+            // Exponential: base * 2^(attempt-1), capped at 5 minutes
+            let delay = self.base_delay_secs.saturating_mul(1u64 << (attempt - 1).min(6));
+            delay.min(300)
+        } else {
+            self.base_delay_secs
+        }
+    }
+
+    pub fn should_restart(
+        &mut self,
+        container_id: &str,
+        container_name: &str,
+        max_override: Option<u32>,
+    ) -> bool {
+        self.apply_cooldown(container_id);
+        let effective_max = max_override.unwrap_or(self.max_restarts);
+
+        // Fast path: check without allocating if already at limit
+        if let Some(state) = self.containers.get(container_id) {
+            if state.attempts >= effective_max {
+                warn!(
+                    "Container '{}' ({}) has reached max restart limit ({}/{}). Giving up.",
+                    container_name, container_id, state.attempts, effective_max
+                );
+                return false;
+            }
+        }
+
+        let state = self.containers.entry(container_id.to_string()).or_insert(ContainerState {
+            attempts: 0,
+            last_restart: None,
+        });
+
+        if state.attempts >= effective_max {
             warn!(
                 "Container '{}' ({}) has reached max restart limit ({}/{}). Giving up.",
-                container_name, container_id, count, self.max_restarts
+                container_name, container_id, state.attempts, effective_max
             );
             return false;
         }
 
-        *count += 1;
+        state.attempts += 1;
+        state.last_restart = Some(Instant::now());
+        let attempts = state.attempts;
+
+        let delay = self.compute_delay(attempts);
         info!(
-            "Restarting container '{}' ({}) in {} seconds... (attempt {}/{})",
-            container_name, container_id, self.delay_secs, count, self.max_restarts
+            "Restarting container '{}' ({}) in {}s... (attempt {}/{})",
+            container_name, container_id, delay, attempts, effective_max
         );
         true
     }
 
-    /// Attempts to restart a container. Returns Ok(true) if restarted,
-    /// Ok(false) if the max restart limit was reached, or Err on failure.
     pub async fn try_restart(
         &mut self,
         docker: &Docker,
         container_id: &str,
         container_name: &str,
+        max_override: Option<u32>,
     ) -> Result<bool, String> {
-        if !self.should_restart(container_id, container_name) {
+        if !self.should_restart(container_id, container_name, max_override) {
             return Ok(false);
         }
 
-        // Wait before restarting
-        sleep(Duration::from_secs(self.delay_secs)).await;
+        let attempt = self.containers.get(container_id).map_or(0, |s| s.attempts);
+        let delay = self.compute_delay(attempt);
 
-        // Attempt the restart via Docker API
-        match docker
-            .restart_container(container_id, None)
-            .await
-        {
+        if self.dry_run {
+            warn!(
+                "[DRY-RUN] Would restart container '{}' ({}) after {}s delay (attempt {}).",
+                container_name, container_id, delay, attempt
+            );
+            return Ok(true);
+        }
+
+        sleep(Duration::from_secs(delay)).await;
+
+        match docker.restart_container(container_id, None).await {
             Ok(_) => {
-                info!(
-                    "Container '{}' ({}) restarted successfully.",
-                    container_name, container_id
-                );
+                info!("Container '{}' ({}) restarted successfully.", container_name, container_id);
                 Ok(true)
             }
             Err(e) => {
-                error!(
-                    "Failed to restart container '{}' ({}): {}",
-                    container_name, container_id, e
-                );
+                error!("Failed to restart container '{}' ({}): {}", container_name, container_id, e);
                 Err(format!("Restart failed: {}", e))
             }
         }
     }
 
-    /// Resets the restart counter for a container (e.g., when it starts cleanly).
     pub fn reset(&mut self, container_id: &str) {
-        self.attempts.remove(container_id);
+        self.containers.remove(container_id);
     }
 
-    /// Returns the current restart count for a container.
     pub fn restart_count(&self, container_id: &str) -> u32 {
-        *self.attempts.get(container_id).unwrap_or(&0)
+        self.containers.get(container_id).map_or(0, |s| s.attempts)
+    }
+
+    pub fn cleanup_stale(&mut self, max_age: Duration) {
+        self.containers.retain(|id, state| {
+            let keep = state.last_restart.map_or(true, |t| t.elapsed() < max_age);
+            if !keep {
+                debug!("Cleaning up stale restart tracking for container {}.", id);
+            }
+            keep
+        });
     }
 }

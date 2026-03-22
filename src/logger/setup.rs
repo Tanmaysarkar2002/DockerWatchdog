@@ -1,7 +1,3 @@
-/// Initializes the application-wide tracing subscriber.
-///
-/// This sets up structured logging that outputs to stdout with
-/// timestamps, log levels, and module targets.
 pub fn init_tracing(log_level: &str) {
     use tracing_subscriber::EnvFilter;
 

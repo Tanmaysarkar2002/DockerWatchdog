@@ -3,7 +3,6 @@ use bollard::Docker;
 use futures_util::StreamExt;
 use tracing::{error, warn};
 
-/// Fetches the last N lines of logs from a container and returns them as a String.
 pub async fn fetch_logs(docker: &Docker, container_id: &str, tail_lines: u64) -> String {
     let opts = Some(LogsOptions {
         stdout: true,
@@ -13,7 +12,7 @@ pub async fn fetch_logs(docker: &Docker, container_id: &str, tail_lines: u64) ->
     });
 
     let mut stream = docker.logs(container_id, opts);
-    let mut output = String::new();
+    let mut output = String::with_capacity(4096);
 
     while let Some(result) = stream.next().await {
         match result {

@@ -6,7 +6,7 @@ fn test_is_failure_nonzero_exit() {
         container_id: "abc123".to_string(),
         container_name: "my-app".to_string(),
         action: "die".to_string(),
-        exit_code: Some("1".to_string()),
+        exit_code: Some(1),
     };
     assert!(event.is_failure());
 }
@@ -17,7 +17,7 @@ fn test_is_failure_zero_exit() {
         container_id: "abc123".to_string(),
         container_name: "my-app".to_string(),
         action: "die".to_string(),
-        exit_code: Some("0".to_string()),
+        exit_code: Some(0),
     };
     assert!(!event.is_failure());
 }
@@ -28,7 +28,7 @@ fn test_is_failure_oom_killed() {
         container_id: "abc123".to_string(),
         container_name: "my-app".to_string(),
         action: "die".to_string(),
-        exit_code: Some("137".to_string()),
+        exit_code: Some(137),
     };
     assert!(event.is_failure());
 }
@@ -61,7 +61,7 @@ fn test_summary_with_exit_code() {
         container_id: "abc123def456".to_string(),
         container_name: "web-server".to_string(),
         action: "die".to_string(),
-        exit_code: Some("1".to_string()),
+        exit_code: Some(1),
     };
     let summary = event.summary();
     assert!(summary.contains("web-server"));
